@@ -1,23 +1,20 @@
-from fastapi import APIRouter, Depends
-from app.middleware.auth import get_current_user
-from app.services.firestore_service import get_db
+from typing import Optional
+from fastapi import APIRouter, Depends, Query
+from app.middleware.auth import CurrentUser, get_current_user
+from app.services.firestore_service import get_firestore
 
 router = APIRouter()
 
+@router.get("/market/share")
+async def get_market_share(category_id: Optional[str] = None, period: Optional[str] = None,
+    user: CurrentUser = Depends(get_current_user), db=Depends(get_firestore)):
+    return {"success": True, "data": {}}
 
-@router.get("/market/map")
-async def get_market_map(
-    user: dict = Depends(get_current_user),
-    db=Depends(get_db),
-):
-    """GET /api/v1/market/map — Datos para visualización del mapa competitivo."""
-    return {"success": True, "data": {"competitors": [], "marketShare": {}}}
+@router.get("/market/import-trends")
+async def get_import_trends(months: int = Query(6, le=24), competitor_ids: Optional[str] = None,
+    user: CurrentUser = Depends(get_current_user), db=Depends(get_firestore)):
+    return {"success": True, "data": {}}
 
-
-@router.get("/market/competitors")
-async def list_competitors(
-    user: dict = Depends(get_current_user),
-    db=Depends(get_db),
-):
-    """GET /api/v1/market/competitors"""
-    return {"success": True, "data": []}
+@router.get("/market/positioning-matrix")
+async def get_positioning_matrix(user: CurrentUser = Depends(get_current_user), db=Depends(get_firestore)):
+    return {"success": True, "data": {}}

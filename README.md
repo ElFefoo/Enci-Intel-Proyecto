@@ -1,89 +1,68 @@
-# Enci-Intel 🐾
+# Enci-Intel — Plataforma de Inteligencia de Mercado
 
-> Sistema de Inteligencia Competitiva del Mercado Veterinario Chileno
-> **Encipharm** · v1.0.0 MVP
+> Encipharm · Sistema de inteligencia competitiva para el mercado veterinario chileno
 
 ## Stack Técnico
+- **Backend**: FastAPI + Python 3.12 → Cloud Run (GCP)
+- **Frontend**: React + TypeScript + Vite → Cloud Run (GCP)
+- **Base de datos**: Firestore (GCP)
+- **Autenticación**: Keycloak + JWT (roles: Admin, Comercial, Gerencia)
+- **IA**: Vertex AI (Gemini) — Consultor Veterinario
+- **Jobs**: Cloud Tasks + Cloud Scheduler
 
-| Capa | Tecnología |
-|---|---|
-| Backend | FastAPI + Python 3.12 |
-| Frontend | React + TypeScript + Tailwind CSS |
-| Base de datos | Firestore (GCP) |
-| Autenticación | Keycloak + JWT |
-| IA | Vertex AI (Gemini) |
-| Despliegue | Cloud Run (GCP) |
-| Jobs asíncronos | Cloud Tasks |
-
-## Estructura del Proyecto
-
-```
-Enci-Intel-Proyecto/
-├── backend/          # FastAPI app
-│   ├── app/
-│   │   ├── agents/   # 5 agentes de inteligencia competitiva
-│   │   ├── middleware/
-│   │   ├── routers/
-│   │   └── services/
-│   └── tests/
-├── frontend/         # React + TypeScript
-│   └── src/
-│       ├── components/
-│       ├── pages/
-│       ├── services/
-│       ├── store/
-│       └── types/
-├── infra/            # Scripts GCP
-├── docker-compose.yml
-└── .github/workflows/ # CI/CD
-```
-
-## Setup Local
+## Inicio Rápido
 
 ```bash
-# 1. Clonar
-git clone https://github.com/ElFefoo/Enci-Intel-Proyecto.git
-cd Enci-Intel-Proyecto
-
-# 2. Variables de entorno
-cp backend/.env.example backend/.env
-cp frontend/.env.example frontend/.env
-# Editar .env con tus valores
-
-# 3. Levantar con Docker Compose
+# 1. Levantar servicios en local
 docker-compose up -d
 
-# Backend: http://localhost:8000
-# Frontend: http://localhost:5173
-# Keycloak:  http://localhost:8080
+# Backend → http://localhost:8000/docs
+# Frontend → http://localhost:5173
+# Keycloak → http://localhost:8080
 ```
 
-## Setup GCP (producción)
-
+## Variables de Entorno
 ```bash
-# Configurar proyecto GCP por primera vez
-bash infra/setup-gcp.sh
+cp backend/.env.example backend/.env
+cp frontend/.env.example frontend/.env
+# Editar valores según tu entorno
 ```
 
-## Módulos
+## Despliegue GCP
+```bash
+# Setup inicial (solo una vez)
+bash infra/setup-gcp.sh
 
-- 📊 **Dashboard** — KPIs, alertas recientes, estado agentes
-- 🔔 **Alertas** — PRICECHANGE, NEWSKU, STOCKOUT, NEWS
-- 🤖 **Agentes IA** — 5 agentes autónomos de monitoreo
-- 📦 **Productos** — Catálogo por competidor y categoría
-- 🗺️ **Mapa Competitivo** — Visualización del mercado
-- 💬 **Consultor Veterinario IA** — Chat con Gemini
-- 📄 **Reportes** — PDF / XLSX
+# Deploy
+gcloud run deploy enci-intel-backend --source ./backend --region us-central1
+gcloud run deploy enci-intel-frontend --source ./frontend --region us-central1
+```
 
-## CI/CD
+## Estructura
+```
+enci-intel/
+├── backend/          # FastAPI Python 3.12
+│   └── app/
+│       ├── agents/   # 5 agentes autónomos
+│       ├── routers/  # 8 módulos API REST
+│       ├── middleware/auth.py  # JWT Keycloak
+│       └── services/ # Firestore client
+├── frontend/         # React + TypeScript + Vite
+│   └── src/
+│       ├── pages/    # Dashboard, Alerts, Agents...
+│       ├── components/layout/
+│       └── store/    # Zustand auth state
+├── infra/            # Scripts GCP + Firestore indexes
+├── .github/workflows/ # CI/CD GitHub Actions
+└── docker-compose.yml
+```
 
-Los workflows en `.github/workflows/` se activan automáticamente al hacer push a `main`:
-- `backend-ci.yml` → test + deploy backend a Cloud Run
-- `frontend-ci.yml` → build + deploy frontend a Cloud Run
+## Agentes IA
 
-### Secrets requeridos en GitHub
-
-| Secret | Descripción |
-|---|---|
-| `GCP_PROJECT_ID` | ID del proyecto GCP |
-| `GCP_SA_KEY` | JSON del Service Account |
+| ID | Nombre | Frecuencia | Alerta |
+|---|---|---|---|
+| `agent-isp-surveillance` | Vigilancia ISP | Diaria | `NEWREGISTRATION` |
+| `agent-customs-intelligence` | Inteligencia Aduanera | Mensual | Tendencias importación |
+| `agent-competitive-monitoring` | Monitoreo Competitivo | Diaria 08:00 | `NEWS` / `NEWSKU` |
+| `agent-price-benchmark` | Benchmarking Precios | Continua | `PRICECHANGE` |
+| `agent-alert-engine` | Motor de Alertas | Reactivo | `STOCKOUT` / priorización |

@@ -1,29 +1,26 @@
+from typing import Optional
 from fastapi import APIRouter, Depends, Query
-from app.middleware.auth import get_current_user
-from app.services.firestore_service import get_db
+from app.middleware.auth import CurrentUser, get_current_user
+from app.services.firestore_service import get_firestore
 
 router = APIRouter()
 
+@router.get("/products/categories")
+async def list_categories(user: CurrentUser = Depends(get_current_user), db=Depends(get_firestore)):
+    return {"success": True, "data": []}
 
-@router.get("/products")
+@router.get("/products/categories/{category_id}/competitors")
+async def list_competitors_by_category(category_id: str, user: CurrentUser = Depends(get_current_user), db=Depends(get_firestore)):
+    return {"success": True, "data": []}
+
+@router.get("/products/categories/{category_id}/competitors/{competitor_id}/products")
 async def list_products(
-    competitor: str | None = Query(None),
-    category: str | None = Query(None),
-    limit: int = Query(20, le=100),
-    cursor: str | None = Query(None),
-    user: dict = Depends(get_current_user),
-    db=Depends(get_db),
+    category_id: str, competitor_id: str,
+    limit: int = Query(20, le=100), cursor: Optional[str] = None,
+    user: CurrentUser = Depends(get_current_user), db=Depends(get_firestore),
 ):
-    """GET /api/v1/products"""
-    return {"success": True, "data": [], "meta": {"total": 0, "hasMore": False, "nextCursor": None}}
+    return {"success": True, "data": [], "meta": {"hasMore": False}}
 
-
-@router.get("/products/{product_id}/price-history")
-async def price_history(
-    product_id: str,
-    days: int = Query(30),
-    user: dict = Depends(get_current_user),
-    db=Depends(get_db),
-):
-    """GET /api/v1/products/{id}/price-history"""
-    return {"success": True, "data": {"productId": product_id, "history": []}}
+@router.get("/products/{product_id}")
+async def get_product(product_id: str, user: CurrentUser = Depends(get_current_user), db=Depends(get_firestore)):
+    return {"success": True, "data": {}}

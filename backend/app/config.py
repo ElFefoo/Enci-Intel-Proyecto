@@ -5,25 +5,33 @@ from functools import lru_cache
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    APP_ENV: str = "development"
-    DEBUG: bool = False
+    gcp_project_id: str = "enci-intel-dev"
+    gcp_region: str = "us-central1"
+    firestore_database: str = "(default)"
 
-    # GCP
-    GCP_PROJECT_ID: str = "enci-intel-dev"
-    GCP_REGION: str = "us-central1"
+    keycloak_url: str = "http://localhost:8080"
+    keycloak_realm: str = "enci-intel"
+    keycloak_client_id: str = "enci-intel-backend"
+    keycloak_jwks_url: str = "http://localhost:8080/realms/enci-intel/protocol/openid-connect/certs"
 
-    # Keycloak
-    KEYCLOAK_URL: str = "http://localhost:8080"
-    KEYCLOAK_REALM: str = "enci-intel"
-    KEYCLOAK_AUDIENCE: str = "enci-intel-backend"
+    vertex_ai_location: str = "us-central1"
+    vertex_ai_model: str = "gemini-1.5-pro"
 
-    # Cloud Tasks
-    CLOUD_TASKS_QUEUE: str = "enci-intel-agents"
-    INTERNAL_API_SECRET: str = "change-me"
+    cloud_tasks_queue: str = "enci-intel-agents"
+    cloud_tasks_handler_url: str = "http://localhost:8000/internal/agents/run"
+
+    app_env: str = "development"
+    log_level: str = "INFO"
+    cors_origins: str = "http://localhost:5173"
+    secret_key: str = "changeme"
 
     @property
-    def KEYCLOAK_JWKS_URL(self) -> str:
-        return f"{self.KEYCLOAK_URL}/realms/{self.KEYCLOAK_REALM}/protocol/openid-connect/certs"
+    def cors_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",")]
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env == "production"
 
 
 @lru_cache

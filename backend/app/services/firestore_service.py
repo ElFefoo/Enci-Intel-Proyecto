@@ -1,10 +1,9 @@
-from google.cloud import firestore
+"""Singleton cliente Firestore."""
 from functools import lru_cache
+from google.cloud import firestore
 from app.config import get_settings
 
-settings = get_settings()
-
-
 @lru_cache
-def get_db() -> firestore.AsyncClient:
-    return firestore.AsyncClient(project=settings.GCP_PROJECT_ID)
+def get_firestore() -> firestore.AsyncClient:
+    settings = get_settings()
+    return firestore.AsyncClient(project=settings.gcp_project_id)
