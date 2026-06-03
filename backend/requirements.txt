@@ -8,7 +8,8 @@ google-cloud-secret-manager==2.20.0
 firebase-admin==6.5.0
 httpx==0.27.0
 beautifulsoup4==4.12.0
-lxml==5.2.0
+# lxml eliminado: usamos html.parser nativo de Python (sin dependencias C)
+# En Cloud Run (Linux) lxml funciona bien si se necesita en el futuro
 slowapi==0.1.9
 structlog==24.2.0
 google-cloud-aiplatform==1.57.0
