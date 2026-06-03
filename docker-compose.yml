@@ -1,50 +1,93 @@
 version: '3.9'
 
+# ============================================================
+# Enci-Intel — Entorno de desarrollo local
+# Uso: docker-compose up
+#
+# Servicios:
+#   backend  → http://localhost:8000  (FastAPI + hot reload)
+#   frontend → http://localhost:5173  (React + Vite)
+#   firestore→ http://localhost:4000  (Emulator UI)
+#
+# Requisitos previos:
+#   1. Copiar backend/.env.example  → backend/.env
+#   2. Copiar frontend/.env.example → frontend/.env
+#   3. Agregar valores Firebase en frontend/.env
+#   4. Credenciales GCP locales (ver README)
+# ============================================================
+
 services:
+
+  # ----------------------------------------------------------
+  # Firestore Emulator
+  # UI disponible en http://localhost:4000
+  # ----------------------------------------------------------
+  firestore:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    ports:
+      - "8888:8888"   # Firestore gRPC
+      - "4000:4000"   # Emulator UI
+    command: >
+      sh -c "gcloud emulators firestore start
+             --host-port=0.0.0.0:8888
+             --project=enci-intel-dev"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000"]
+      interval: 10s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # Backend FastAPI
+  # API docs: http://localhost:8000/docs
+  # Health:   http://localhost:8000/health
+  # ----------------------------------------------------------
   backend:
     build:
       context: ./backend
       target: runtime
     ports:
       - "8000:8080"
+    env_file:
+      - ./backend/.env
     environment:
       APP_ENV: development
       GCP_PROJECT_ID: enci-intel-dev
-      KEYCLOAK_URL: http://keycloak:8080
-      KEYCLOAK_REALM: enci-intel
-      FIRESTORE_EMULATOR_HOST: localhost:8888
+      FIREBASE_PROJECT_ID: enci-intel-dev
+      FIRESTORE_EMULATOR_HOST: firestore:8888
+      # En dev, Firebase Admin SDK usa ADC via gcloud o GOOGLE_APPLICATION_CREDENTIALS
+      # Si tienes un serviceAccountKey.json, descomenta la siguiente linea:
+      # GOOGLE_APPLICATION_CREDENTIALS: /app/serviceAccountKey.json
     volumes:
       - ./backend:/app
+      # Descomentar si usas serviceAccountKey.json local:
+      # - ./serviceAccountKey.json:/app/serviceAccountKey.json:ro
     depends_on:
-      - keycloak
+      firestore:
+        condition: service_healthy
     command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      retries: 3
 
+  # ----------------------------------------------------------
+  # Frontend React + Vite
+  # App: http://localhost:5173
+  # ----------------------------------------------------------
   frontend:
     build:
       context: ./frontend
       target: builder
     ports:
       - "5173:5173"
+    env_file:
+      - ./frontend/.env
     environment:
       VITE_API_URL: http://localhost:8000/api/v1
-      VITE_KEYCLOAK_URL: http://localhost:8080
-      VITE_KEYCLOAK_REALM: enci-intel
-      VITE_KEYCLOAK_CLIENT_ID: enci-intel-frontend
+      VITE_APP_ENV: development
     volumes:
       - ./frontend:/app
       - /app/node_modules
+    depends_on:
+      - backend
     command: npm run dev -- --host
-
-  keycloak:
-    image: quay.io/keycloak/keycloak:25.0
-    ports:
-      - "8080:8080"
-    environment:
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
-    command: start-dev
-    volumes:
-      - keycloak_data:/opt/keycloak/data
-
-volumes:
-  keycloak_data:
