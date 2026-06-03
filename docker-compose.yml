@@ -1,0 +1,50 @@
+version: '3.9'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      target: runtime
+    ports:
+      - "8000:8080"
+    environment:
+      APP_ENV: development
+      GCP_PROJECT_ID: enci-intel-dev
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: enci-intel
+      FIRESTORE_EMULATOR_HOST: localhost:8888
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - keycloak
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+
+  frontend:
+    build:
+      context: ./frontend
+      target: builder
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:8000/api/v1
+      VITE_KEYCLOAK_URL: http://localhost:8080
+      VITE_KEYCLOAK_REALM: enci-intel
+      VITE_KEYCLOAK_CLIENT_ID: enci-intel-frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm run dev -- --host
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0
+    ports:
+      - "8080:8080"
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    command: start-dev
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+
+volumes:
+  keycloak_data:
