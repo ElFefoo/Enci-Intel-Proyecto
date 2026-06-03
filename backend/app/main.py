@@ -9,6 +9,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.config import get_settings
 from app.routers import dashboard, alerts, agents, products, market, chat, reports
+from app.routers.admin import router as admin_router
 from app.routers.internal import router as internal_router
 
 logger = structlog.get_logger()
@@ -50,6 +51,7 @@ app.include_router(products.router,  prefix="/api/v1", tags=["Productos"])
 app.include_router(market.router,    prefix="/api/v1", tags=["Mapa Competitivo"])
 app.include_router(chat.router,      prefix="/api/v1", tags=["Consultor Vet IA"])
 app.include_router(reports.router,   prefix="/api/v1", tags=["Reportes"])
+app.include_router(admin_router,     prefix="/api/v1", tags=["Admin Usuarios"])
 app.include_router(internal_router,  prefix="/internal", tags=["Internal"])
 
 @app.get("/health", tags=["Health"])

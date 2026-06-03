@@ -9,10 +9,8 @@ class Settings(BaseSettings):
     gcp_region: str = "us-central1"
     firestore_database: str = "(default)"
 
-    keycloak_url: str = "http://localhost:8080"
-    keycloak_realm: str = "enci-intel"
-    keycloak_client_id: str = "enci-intel-backend"
-    keycloak_jwks_url: str = "http://localhost:8080/realms/enci-intel/protocol/openid-connect/certs"
+    # Firebase Auth — en Cloud Run se usa ADC automaticamente
+    firebase_project_id: str = "enci-intel-dev"
 
     vertex_ai_location: str = "us-central1"
     vertex_ai_model: str = "gemini-1.5-pro"
@@ -23,7 +21,6 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
     cors_origins: str = "http://localhost:5173"
-    secret_key: str = "changeme"
 
     @property
     def cors_origins_list(self) -> list[str]:
