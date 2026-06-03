@@ -1,13 +1,16 @@
 """Agente SAG — Monitor del Registro Oficial de Medicamentos Veterinarios.
 
 Hereda de BaseAgent y sigue el pipeline: fetch → process → save → generate_alerts.
+
+Imports pesados (google-cloud-storage) se hacen de forma lazy dentro de los
+métodos que los necesitan, para que el módulo cargue correctamente incluso en
+entornos de desarrollo donde ese paquete no está instalado.
 """
 
 from io import BytesIO
 
 import httpx
 import pandas as pd
-from google.cloud import storage
 
 from .base_agent import BaseAgent
 
@@ -38,11 +41,11 @@ COMPETIDORES = [
     "VETERQUÍMICA S.A.",
 ]
 
-COL_IMPORTADOR   = "Importador o Registrante"
-COL_REGISTRO     = "Registro"
-COL_NOMBRE_COM   = "Nombre Comercial"
-COL_ESPECIES     = "Especies"
-COL_PRINCIPIOS   = "Principios Activos"
+COL_IMPORTADOR    = "Importador o Registrante"
+COL_REGISTRO      = "Registro"
+COL_NOMBRE_COM    = "Nombre Comercial"
+COL_ESPECIES      = "Especies"
+COL_PRINCIPIOS    = "Principios Activos"
 COL_CLASIFICACION = "Clasificación"
 
 
@@ -51,7 +54,7 @@ class SagAgent(BaseAgent):
 
     def __init__(self, db):
         super().__init__(agent_id="sag-monitor", db=db)
-        self._es_seed: bool = False  # se determina en fetch()
+        self._es_seed: bool = False  # se determina en process()
 
     # ── 1. fetch ──────────────────────────────────────────────────────────────
 
@@ -70,10 +73,9 @@ class SagAgent(BaseAgent):
                 "SAG devolvió HTML en vez de Excel — posible cambio en la URL."
             )
 
-        self._raw_bytes = r.content
         self.log.info("sag_downloaded", bytes=len(r.content))
 
-        # Guardar en GCS (latest + histórico)
+        # Guardar en GCS (latest + histórico) — falla silenciosamente si no hay credenciales
         self._guardar_gcs(r.content)
 
         # Parsear y filtrar por competidores
@@ -99,7 +101,7 @@ class SagAgent(BaseAgent):
             return raw_data  # guarda todo, sin alertas
 
         # Modo monitor → detectar diferencias
-        nuevos     = [r for r in raw_data if f"sag_{str(r[COL_REGISTRO]).strip()}" not in registros_db]
+        nuevos = [r for r in raw_data if f"sag_{str(r[COL_REGISTRO]).strip()}" not in registros_db]
         cancelados = [
             v for k, v in registros_db.items()
             if k.replace("sag_", "") not in registros_sag
@@ -114,7 +116,6 @@ class SagAgent(BaseAgent):
     async def save(self, data: list[dict]) -> None:
         """Guarda productos nuevos en Firestore. Marca cancelados."""
         from datetime import datetime, timezone
-        from google.cloud import firestore
 
         now   = datetime.now(timezone.utc)
         batch = self.db.batch()
@@ -152,6 +153,7 @@ class SagAgent(BaseAgent):
             return 0
 
         from datetime import datetime, timezone
+
         now   = datetime.now(timezone.utc)
         batch = self.db.batch()
         count = 0
@@ -202,8 +204,10 @@ class SagAgent(BaseAgent):
         return df.fillna("")
 
     def _guardar_gcs(self, content: bytes) -> None:
+        """Sube el Excel a Cloud Storage. Falla silenciosamente si no hay credenciales."""
         from datetime import datetime, timezone
         try:
+            from google.cloud import storage  # lazy import — no requerido en desarrollo local
             client = storage.Client()
             bucket = client.bucket(GCS_BUCKET)
             fecha  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
