@@ -9,7 +9,6 @@ class Settings(BaseSettings):
     gcp_region: str = "us-central1"
     firestore_database: str = "(default)"
 
-    # Firebase Auth — en Cloud Run se usa ADC automaticamente
     firebase_project_id: str = "enci-intel-dev"
 
     vertex_ai_location: str = "us-central1"
@@ -21,6 +20,12 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
     cors_origins: str = "http://localhost:5173"
+
+    # ------------------------------------------------------------------
+    # SOLO DESARROLLO LOCAL — nunca True en produccion
+    # Activa con DISABLE_AUTH=true en backend/.env
+    # ------------------------------------------------------------------
+    disable_auth: bool = False
 
     @property
     def cors_origins_list(self) -> list[str]:

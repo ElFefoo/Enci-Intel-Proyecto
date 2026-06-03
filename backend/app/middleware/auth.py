@@ -1,15 +1,9 @@
 """
 Middleware de autenticacion — Firebase Auth (Identity Platform)
 
-Flujo:
-  1. Frontend hace login con Firebase Auth SDK (email/password u OAuth)
-  2. Firebase emite un ID Token JWT firmado por Google
-  3. Frontend envia el token en cada request: Authorization: Bearer <id_token>
-  4. Este middleware verifica el token con firebase-admin (sin red — usa clave publica de Google)
-  5. Lee el custom claim 'role' (Admin | Comercial | Gerencia) asignado via Admin SDK
-
-En Cloud Run: firebase_admin usa Application Default Credentials automaticamente.
-En local: requiere GOOGLE_APPLICATION_CREDENTIALS apuntando a serviceAccountKey.json
+MODO DESARROLLO: agregar DISABLE_AUTH=true en backend/.env para
+bypasear Firebase completamente. Retorna un usuario Admin mock.
+Nunca usar en produccion.
 """
 from functools import lru_cache
 from typing import Annotated
@@ -21,14 +15,15 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import get_settings
 
-bearer_scheme = HTTPBearer()
+bearer_scheme = HTTPBearer(auto_error=False)
 
 ROLES_VALIDOS = {"Admin", "Comercial", "Gerencia"}
+
+MOCK_USER_ADMIN = None  # se instancia lazy abajo
 
 
 @lru_cache
 def _init_firebase():
-    """Inicializa Firebase Admin SDK una sola vez (singleton)."""
     settings = get_settings()
     if not firebase_admin._apps:
         firebase_admin.initialize_app(
@@ -51,40 +46,56 @@ class CurrentUser:
         return self.role in ("Admin", "Gerencia")
 
 
-async def get_current_user(
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer_scheme)],
-) -> CurrentUser:
-    """Dependencia FastAPI — verifica ID Token de Firebase y extrae el usuario."""
-    _init_firebase()
-
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail={
-            "success": False,
-            "error": {"code": "UNAUTHORIZED", "message": "Token Firebase invalido o expirado."},
-        },
-        headers={"WWW-Authenticate": "Bearer"},
+def _mock_user() -> CurrentUser:
+    return CurrentUser(
+        user_id="dev-mock-uid-001",
+        email="admin@encipharm.cl",
+        role="Admin",
+        name="Dev Admin",
     )
+
+
+async def get_current_user(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
+) -> CurrentUser:
+    settings = get_settings()
+
+    # ------------------------------------------------------------------ #
+    # MODO DESARROLLO — bypass total de Firebase                          #
+    # Activar con DISABLE_AUTH=true en backend/.env                       #
+    # ------------------------------------------------------------------ #
+    if getattr(settings, "disable_auth", False):
+        return _mock_user()
+
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"success": False, "error": {"code": "UNAUTHORIZED", "message": "Token requerido."}},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    _init_firebase()
 
     try:
         decoded = firebase_auth.verify_id_token(credentials.credentials)
     except firebase_auth.ExpiredIdTokenError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"success": False, "error": {"code": "TOKEN_EXPIRED", "message": "Token expirado. Vuelve a iniciar sesion."}},
+            detail={"success": False, "error": {"code": "TOKEN_EXPIRED", "message": "Token expirado."}},
             headers={"WWW-Authenticate": "Bearer"},
         )
     except Exception:
-        raise credentials_exception
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"success": False, "error": {"code": "UNAUTHORIZED", "message": "Token Firebase invalido."}},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     role: str | None = decoded.get("role")
     if not role or role not in ROLES_VALIDOS:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "success": False,
-                "error": {"code": "NO_ROLE", "message": f"Usuario sin rol valido. Contacta al administrador."},
-            },
+            detail={"success": False, "error": {"code": "NO_ROLE", "message": "Usuario sin rol valido."}},
         )
 
     return CurrentUser(
@@ -95,10 +106,7 @@ async def get_current_user(
     )
 
 
-def require_admin(
-    user: Annotated[CurrentUser, Depends(get_current_user)],
-) -> CurrentUser:
-    """Dependencia que exige rol Admin."""
+def require_admin(user: Annotated[CurrentUser, Depends(get_current_user)]) -> CurrentUser:
     if not user.is_admin():
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -107,10 +115,7 @@ def require_admin(
     return user
 
 
-def require_gerencia(
-    user: Annotated[CurrentUser, Depends(get_current_user)],
-) -> CurrentUser:
-    """Dependencia que exige rol Admin o Gerencia."""
+def require_gerencia(user: Annotated[CurrentUser, Depends(get_current_user)]) -> CurrentUser:
     if not user.is_gerencia():
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
