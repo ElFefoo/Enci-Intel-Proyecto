@@ -2,31 +2,45 @@
 
 Hereda de BaseAgent y sigue el pipeline: fetch → process → save → generate_alerts.
 
-Imports pesados (google-cloud-storage) se hacen de forma lazy dentro de los
-métodos que los necesitan, para que el módulo cargue correctamente incluso en
-entornos de desarrollo donde ese paquete no está instalado.
+El SAG usa sesiones ASP clásicas: primero hay que visitar la página de búsqueda
+para obtener las cookies de sesión, y luego hacer el request al Excel dentro
+de la misma sesión HTTP.
 """
 
 from io import BytesIO
+from html import unescape
+import re
 
 import httpx
 import pandas as pd
 
 from .base_agent import BaseAgent
 
-# ── Configuración ─────────────────────────────────────────────────────────────
+# ── URLs SAG ────────────────────────────────────────────────────────────
 
-SAG_EXCEL_URL = (
-    "https://medicamentos.sag.gob.cl/ConsultaUsrPublico/BusquedaMedicamentosExcel.asp"
+SAG_BASE       = "https://medicamentos.sag.gob.cl/ConsultaUsrPublico"
+SAG_BUSQUEDA   = f"{SAG_BASE}/BusquedaMedicamentos.asp"
+SAG_EXCEL_URL  = (
+    f"{SAG_BASE}/BusquedaMedicamentosExcel.asp"
     "?Txt_Numero=|*|&Txt_Tipo=&Txt_NGenerico=|*|&Txt_NComercial=|*|"
     "&Txt_Forma=&Txt_Via=&Txt_Clasificacion=&Txt_Pais=&Txt_Empresa="
     "&Txt_Importador=&Txt_Regimen=&Txt_Especie=&Txt_Principio="
     "&Txt_Condicion=&Txt_Via_Texto=|*|&Txt_Especie_Texto=|*|&Txt_Principio_Texto=|*|"
 )
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml,*/*",
+    "Accept-Language": "es-CL,es;q=0.9",
+}
+
+# ── GCS ─────────────────────────────────────────────────────────────────────
+
 GCS_BUCKET         = "enci-intel-data"
 GCS_LATEST_PATH    = "sag/latest.xlsx"
 GCS_HISTORICO_PATH = "sag/historico/{fecha}.xlsx"
+
+# ── Competidores ───────────────────────────────────────────────────────────
 
 COMPETIDORES = [
     "ZOETIS DE CHILE S.A.",
@@ -44,6 +58,7 @@ COMPETIDORES = [
 COL_IMPORTADOR    = "Importador o Registrante"
 COL_REGISTRO      = "Registro"
 COL_NOMBRE_COM    = "Nombre Comercial"
+COL_NOMBRE_COM2   = "Nombre comercial"   # variante en el HTML
 COL_ESPECIES      = "Especies"
 COL_PRINCIPIOS    = "Principios Activos"
 COL_CLASIFICACION = "Clasificación"
@@ -54,59 +69,71 @@ class SagAgent(BaseAgent):
 
     def __init__(self, db):
         super().__init__(agent_id="sag-monitor", db=db)
-        self._es_seed: bool = False  # se determina en process()
+        self._es_seed: bool = False
 
     # ── 1. fetch ──────────────────────────────────────────────────────────────
 
     async def fetch(self) -> list[dict]:
-        """Descarga el Excel completo del SAG via GET directo."""
+        """Establece sesión ASP, luego descarga el Excel del SAG."""
         self.log.info("sag_downloading")
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+
+        async with httpx.AsyncClient(
+            timeout=60, follow_redirects=True, headers=HEADERS
+        ) as client:
+            # Paso 1: visitar la página principal para obtener cookies de sesión
+            await client.get(SAG_BUSQUEDA)
+
+            # Paso 2: descargar el Excel dentro de la misma sesión
             r = await client.get(SAG_EXCEL_URL)
 
         if r.status_code != 200:
             raise RuntimeError(f"SAG respondió HTTP {r.status_code}")
 
-        content_type = r.headers.get("content-type", "")
-        if "html" in content_type.lower():
-            raise RuntimeError(
-                "SAG devolvió HTML en vez de Excel — posible cambio en la URL."
-            )
+        content = r.content
+        self.log.info("sag_downloaded", bytes=len(content))
 
-        self.log.info("sag_downloaded", bytes=len(r.content))
+        # El SAG devuelve HTML con Content-Type: application/vnd.ms-excel
+        # Detectar si es HTML y parsearlo como tabla, o si es Excel binario
+        es_html = content[:20].lower().lstrip().startswith(b"<")
+        if es_html:
+            df = self._parsear_html(content)
+        else:
+            df = self._parsear_excel(content)
 
-        # Guardar en GCS (latest + histórico) — falla silenciosamente si no hay credenciales
-        self._guardar_gcs(r.content)
+        if df.empty:
+            raise RuntimeError("SAG devolvió respuesta vacía o sin datos válidos.")
 
-        # Parsear y filtrar por competidores
-        df = self._parsear(r.content)
+        self.log.info("sag_parsed", total_filas=len(df))
+
+        # Guardar raw en GCS (falla silenciosamente en desarrollo)
+        self._guardar_gcs(content)
+
+        # Filtrar por competidores
+        df = self._filtrar_competidores(df)
+        self.log.info("sag_filtered", competidores=len(df))
         return df.to_dict(orient="records")
 
     # ── 2. process ────────────────────────────────────────────────────────────
 
     async def process(self, raw_data: list[dict]) -> list[dict]:
         """Determina si es seed o monitor y detecta diferencias."""
-        registros_sag = {str(r[COL_REGISTRO]).strip() for r in raw_data}
+        registros_sag = {str(r.get(COL_REGISTRO, "")).strip() for r in raw_data}
 
-        # Registros vigentes en Firestore
         docs_stream = self.db.collection("products").where("source", "==", "SAG").stream()
         registros_db = {}
         async for doc in docs_stream:
             registros_db[doc.id] = doc.to_dict()
 
-        # Primera vez → modo seed
         if not registros_db:
             self._es_seed = True
             self.log.info("sag_seed_mode")
-            return raw_data  # guarda todo, sin alertas
+            return raw_data
 
-        # Modo monitor → detectar diferencias
-        nuevos = [r for r in raw_data if f"sag_{str(r[COL_REGISTRO]).strip()}" not in registros_db]
+        nuevos = [r for r in raw_data if f"sag_{str(r.get(COL_REGISTRO, '')).strip()}" not in registros_db]
         cancelados = [
             v for k, v in registros_db.items()
             if k.replace("sag_", "") not in registros_sag
         ]
-
         self._cancelados = cancelados
         self.log.info("sag_diff", nuevos=len(nuevos), cancelados=len(cancelados))
         return nuevos
@@ -114,15 +141,13 @@ class SagAgent(BaseAgent):
     # ── 3. save ───────────────────────────────────────────────────────────────
 
     async def save(self, data: list[dict]) -> None:
-        """Guarda productos nuevos en Firestore. Marca cancelados."""
         from datetime import datetime, timezone
-
         now   = datetime.now(timezone.utc)
         batch = self.db.batch()
         count = 0
 
         for row in data:
-            doc_id  = f"sag_{str(row[COL_REGISTRO]).strip()}"
+            doc_id  = f"sag_{str(row.get(COL_REGISTRO, '')).strip()}"
             doc_ref = self.db.collection("products").document(doc_id)
             batch.set(doc_ref, {
                 **row,
@@ -136,7 +161,6 @@ class SagAgent(BaseAgent):
                 await batch.commit()
                 batch = self.db.batch()
 
-        # Marcar cancelados (no borrar)
         for p in getattr(self, "_cancelados", []):
             doc_id  = f"sag_{str(p.get(COL_REGISTRO, '')).strip()}"
             doc_ref = self.db.collection("products").document(doc_id)
@@ -148,15 +172,15 @@ class SagAgent(BaseAgent):
     # ── 4. generate_alerts ────────────────────────────────────────────────────
 
     async def generate_alerts(self, data: list[dict]) -> int:
-        """Crea alertas NEWSKU y CANCELACION. En modo seed no genera alertas."""
         if self._es_seed:
             return 0
 
         from datetime import datetime, timezone
-
         now   = datetime.now(timezone.utc)
         batch = self.db.batch()
         count = 0
+
+        nombre_col = COL_NOMBRE_COM if COL_NOMBRE_COM in (data[0] if data else {}) else COL_NOMBRE_COM2
 
         for p in data:
             ref = self.db.collection("alerts").document()
@@ -164,7 +188,7 @@ class SagAgent(BaseAgent):
                 "type":     "NEWSKU",
                 "source":   "SAG",
                 "severity": "medium",
-                "title":    f"Nuevo registro SAG: {p.get(COL_NOMBRE_COM, 'Sin nombre')}",
+                "title":    f"Nuevo registro SAG: {p.get(nombre_col, p.get(COL_NOMBRE_COM2, 'Sin nombre'))}",
                 "body": (
                     f"Empresa: {p.get(COL_IMPORTADOR, '')}\n"
                     f"Especie: {p.get(COL_ESPECIES, '')}\n"
@@ -183,7 +207,7 @@ class SagAgent(BaseAgent):
                 "type":     "CANCELACION",
                 "source":   "SAG",
                 "severity": "high",
-                "title":    f"Registro SAG cancelado: {p.get(COL_NOMBRE_COM, 'Sin nombre')}",
+                "title":    f"Registro SAG cancelado: {p.get(COL_NOMBRE_COM, p.get(COL_NOMBRE_COM2, 'Sin nombre'))}",
                 "body":     f"Empresa: {p.get(COL_IMPORTADOR, '')}\nEl producto ya no aparece en el registro oficial SAG.",
                 "metadata": p,
                 "read":       False,
@@ -196,26 +220,50 @@ class SagAgent(BaseAgent):
 
     # ── Helpers privados ──────────────────────────────────────────────────────
 
-    def _parsear(self, content: bytes) -> pd.DataFrame:
-        df = pd.read_excel(BytesIO(content), dtype=str)
+    def _parsear_html(self, content: bytes) -> pd.DataFrame:
+        """Parsea la tabla HTML que devuelve el SAG (formato real)."""
+        try:
+            dfs = pd.read_html(BytesIO(content), encoding="utf-8", flavor="lxml")
+        except Exception:
+            dfs = pd.read_html(BytesIO(content), encoding="utf-8")
+        if not dfs:
+            return pd.DataFrame()
+        df = dfs[0].copy()
         df.columns = df.columns.str.strip()
-        df[COL_IMPORTADOR] = df[COL_IMPORTADOR].str.strip().str.upper()
-        df = df[df[COL_IMPORTADOR].isin(COMPETIDORES)].copy()
-        return df.fillna("")
+        return df.fillna("").astype(str)
+
+    def _parsear_excel(self, content: bytes) -> pd.DataFrame:
+        """Parsea un Excel binario real (.xls/.xlsx)."""
+        for engine in ["openpyxl", "xlrd"]:
+            try:
+                df = pd.read_excel(BytesIO(content), dtype=str, engine=engine)
+                df.columns = df.columns.str.strip()
+                return df.fillna("")
+            except Exception:
+                continue
+        return pd.DataFrame()
+
+    def _filtrar_competidores(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Filtra el DataFrame por la lista de competidores."""
+        col = next(
+            (c for c in df.columns if "importador" in c.lower() or "registrante" in c.lower()),
+            None,
+        )
+        if col is None:
+            self.log.warning("sag_col_importador_no_encontrada", columns=list(df.columns))
+            return pd.DataFrame()
+        df[col] = df[col].str.strip().str.upper()
+        return df[df[col].isin(COMPETIDORES)].copy()
 
     def _guardar_gcs(self, content: bytes) -> None:
-        """Sube el Excel a Cloud Storage. Falla silenciosamente si no hay credenciales."""
         from datetime import datetime, timezone
         try:
-            from google.cloud import storage  # lazy import — no requerido en desarrollo local
+            from google.cloud import storage  # lazy import
             client = storage.Client()
             bucket = client.bucket(GCS_BUCKET)
             fecha  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             for path in [GCS_LATEST_PATH, GCS_HISTORICO_PATH.format(fecha=fecha)]:
-                bucket.blob(path).upload_from_string(
-                    content,
-                    content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+                bucket.blob(path).upload_from_string(content)
             self.log.info("sag_gcs_saved")
         except Exception as e:
             self.log.warning("sag_gcs_error", error=str(e))
