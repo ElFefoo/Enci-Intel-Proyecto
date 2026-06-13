@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
+import { Routes, Route, NavLink } from 'react-router-dom'
 import ConsultorIA from './pages/ConsultorIA'
 
 function Sidebar() {
@@ -60,21 +60,19 @@ function PlaceholderPage({ title }: { title: string }) {
 
 export default function App() {
   return (
-    <BrowserRouter>
-      <div className="flex h-screen overflow-hidden bg-gray-50">
-        <Sidebar />
-        <main className="flex-1 overflow-hidden">
-          <Routes>
-            <Route path="/" element={<PlaceholderPage title="Dashboard" />} />
-            <Route path="/alertas" element={<PlaceholderPage title="Alertas" />} />
-            <Route path="/agentes" element={<PlaceholderPage title="Agentes IA" />} />
-            <Route path="/productos" element={<PlaceholderPage title="Productos" />} />
-            <Route path="/mapa" element={<PlaceholderPage title="Mapa Competitivo" />} />
-            <Route path="/consultor" element={<ConsultorIA />} />
-            <Route path="/reportes" element={<PlaceholderPage title="Reportes" />} />
-          </Routes>
-        </main>
-      </div>
-    </BrowserRouter>
+    <div className="flex h-screen overflow-hidden bg-gray-50">
+      <Sidebar />
+      <main className="flex-1 overflow-hidden">
+        <Routes>
+          <Route path="/" element={<PlaceholderPage title="Dashboard" />} />
+          <Route path="/alertas" element={<PlaceholderPage title="Alertas" />} />
+          <Route path="/agentes" element={<PlaceholderPage title="Agentes IA" />} />
+          <Route path="/productos" element={<PlaceholderPage title="Productos" />} />
+          <Route path="/mapa" element={<PlaceholderPage title="Mapa Competitivo" />} />
+          <Route path="/consultor" element={<ConsultorIA />} />
+          <Route path="/reportes" element={<PlaceholderPage title="Reportes" />} />
+        </Routes>
+      </main>
+    </div>
   )
 }
