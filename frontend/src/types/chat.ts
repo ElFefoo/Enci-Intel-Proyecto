@@ -1,4 +1,12 @@
-export type Species = 'bovino' | 'porcino' | 'aviar' | 'canino' | 'felino' | 'equino'
+// Species alineados con la spec del API
+export type Species =
+  | 'aves'
+  | 'porcinos'
+  | 'rumiantes'
+  | 'peces'
+  | 'caninos'
+  | 'felinos'
+  | 'equinos'
 
 export interface ChatMessage {
   id: string
@@ -8,6 +16,7 @@ export interface ChatMessage {
   category?: string
   createdAt: Date
   isStreaming?: boolean
+  sources?: number
 }
 
 export interface ChatSession {
@@ -29,6 +38,8 @@ export interface SSEToken {
   type: 'token' | 'done' | 'error'
   content?: string
   session_id?: string
+  message_id?: string
   context_sources?: number
+  sources?: { title: string; type: string }[]
   message?: string
 }

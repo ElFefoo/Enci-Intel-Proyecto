@@ -1,13 +1,13 @@
 """
-Servicio Gemini para el Consultor Veterinario IA.
+Servicio LLM para el Consultor Veterinario IA.
 
-Tres modos configurables via .env:
+Cuatro modos configurables via .env (GEMINI_MODE):
+  mock      → respuesta hardcodeada, sin API, sin costo (default local)
+  api_key   → Gemini API Key de Google AI Studio
+  groq      → Groq API (GRATIS, sin tarjeta) ← recomendado para desarrollo
+  vertex    → Vertex AI GCP (producción)
 
-  GEMINI_MODE=mock      → respuesta hardcodeada, sin API, sin costo (default local)
-  GEMINI_MODE=api_key   → Gemini API con API Key de Google AI Studio (GRATIS con free tier)
-  GEMINI_MODE=vertex    → Vertex AI con credenciales GCP (producción)
-
-Para modo api_key, obtener key en: https://aistudio.google.com/app/apikey
+Groq: https://console.groq.com  |  Gemini: https://aistudio.google.com/app/apikey
 """
 import json
 import asyncio
@@ -32,10 +32,23 @@ Directrices:
 - Siempre aclara que las dosis deben ser validadas por un médico veterinario.
 """
 
+# Mapeo de valores de species frontend -> texto legible para el prompt
+SPECIES_LABELS = {
+    "aves": "Aves (avicultura)",
+    "porcinos": "Porcinos",
+    "rumiantes": "Rumiantes (bovinos, ovinos, caprinos)",
+    "peces": "Peces (acuicultura)",
+    "caninos": "Caninos",
+    "felinos": "Felinos",
+    "equinos": "Equinos",
+}
+
 
 def _build_prompt(question: str, species: str | None, category: str | None, context: str) -> str:
     parts = []
-    if species:
+    if species and species in SPECIES_LABELS:
+        parts.append(f"Especie animal: {SPECIES_LABELS[species]}")
+    elif species:
         parts.append(f"Especie animal: {species}")
     if category:
         parts.append(f"Categoría terapéutica: {category}")
@@ -52,66 +65,103 @@ async def stream_gemini_response(
     context: str = "",
     history: list[dict] | None = None,
 ) -> AsyncGenerator[str, None]:
-    """
-    Punto de entrada único. Despacha al modo correcto según GEMINI_MODE en .env.
-    """
     mode = getattr(settings, "gemini_mode", "mock").lower()
 
-    if mode == "api_key":
+    if mode == "groq":
+        async for event in _groq_stream(question, species, category, context, history):
+            yield event
+    elif mode == "api_key":
         async for event in _api_key_stream(question, species, category, context, history):
             yield event
     elif mode == "vertex":
         async for event in _vertex_stream(question, species, category, context, history):
             yield event
-    else:  # mock (default)
+    else:
         async for event in _mock_stream(question, species, category):
             yield event
 
 
 # ---------------------------------------------------------------------------
-# MODO 1: Mock local — sin API, sin costo
+# MODO 1: Mock
 # ---------------------------------------------------------------------------
-async def _mock_stream(
-    question: str,
-    species: str | None,
-    category: str | None,
-) -> AsyncGenerator[str, None]:
-    """Generador hardcodeado para desarrollo local sin ninguna API."""
-    especie_txt = f" para {species}" if species else ""
+async def _mock_stream(question: str, species: str | None, category: str | None) -> AsyncGenerator[str, None]:
+    especie_txt = f" para {SPECIES_LABELS.get(species or '', species or '')}"\
+        if species else ""
     categoria_txt = f" en categoría {category}" if category else ""
 
     respuesta = (
         f"**[MOCK Consultor Vet IA]** — Respuesta simulada{especie_txt}{categoria_txt}\n\n"
         f"📋 **Consulta recibida:** {question}\n\n"
-        "🔬 **Información técnica (simulada, siempre igual):**\n"
+        "🔬 **Información técnica (simulada):**\n"
         "- Principio activo: Enrofloxacina 10%\n"
         "- Dosis estándar: 5 mg/kg/día vía subcutánea\n"
         "- Duración tratamiento: 3-5 días\n"
         "- Esperar 14 días antes del sacrificio\n\n"
-        "⚠️ *Entorno mock — activar GEMINI_MODE=api_key para respuestas reales.*"
+        "⚠️ *Entorno mock — configura GEMINI_MODE=groq para respuestas reales gratuitas.*"
     )
-
-    for i, word in enumerate(respuesta.split(" ")):
-        chunk = word + (" " if i < len(respuesta.split(" ")) - 1 else "")
+    words = respuesta.split(" ")
+    for i, word in enumerate(words):
+        chunk = word + (" " if i < len(words) - 1 else "")
         yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
         await asyncio.sleep(0.03)
-
-    yield f"data: {json.dumps({'type': 'done', 'context_sources': 0, 'session_id': 'mock-session'})}\n\n"
+    yield f"data: {json.dumps({'type': 'done', 'context_sources': 0, 'sources': [], 'session_id': 'mock-session'})}\n\n"
 
 
 # ---------------------------------------------------------------------------
-# MODO 2: Gemini API Key — Google AI Studio, free tier generoso
-# Requiere: pip install google-generativeai
-# API Key en: https://aistudio.google.com/app/apikey
+# MODO 2: Groq (GRATIS, sin tarjeta)
+# pip install groq
+# API Key: https://console.groq.com
+# ---------------------------------------------------------------------------
+async def _groq_stream(
+    question: str, species: str | None, category: str | None,
+    context: str, history: list[dict] | None,
+) -> AsyncGenerator[str, None]:
+    try:
+        from groq import Groq
+
+        api_key = getattr(settings, "groq_api_key", "")
+        if not api_key:
+            raise ValueError("GROQ_API_KEY no configurada en .env")
+
+        client = Groq(api_key=api_key)
+        prompt = _build_prompt(question, species, category, context)
+
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if history:
+            for msg in history[-10:]:
+                messages.append({"role": msg["role"], "content": msg["content"]})
+        messages.append({"role": "user", "content": prompt})
+
+        loop = asyncio.get_event_loop()
+        stream = await loop.run_in_executor(
+            None,
+            lambda: client.chat.completions.create(
+                model=getattr(settings, "groq_model", "llama-3.3-70b-versatile"),
+                messages=messages,
+                stream=True,
+                max_tokens=2048,
+            ),
+        )
+
+        for chunk in stream:
+            content = chunk.choices[0].delta.content
+            if content:
+                yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
+                await asyncio.sleep(0)
+
+        yield f"data: {json.dumps({'type': 'done', 'context_sources': 1 if context else 0, 'sources': []})}\n\n"
+
+    except Exception as e:
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# MODO 3: Gemini API Key
 # ---------------------------------------------------------------------------
 async def _api_key_stream(
-    question: str,
-    species: str | None,
-    category: str | None,
-    context: str,
-    history: list[dict] | None,
+    question: str, species: str | None, category: str | None,
+    context: str, history: list[dict] | None,
 ) -> AsyncGenerator[str, None]:
-    """Streaming con Gemini API Key (google-generativeai). Gratis en free tier."""
     try:
         import google.generativeai as genai
 
@@ -120,13 +170,11 @@ async def _api_key_stream(
             raise ValueError("GEMINI_API_KEY no configurada en .env")
 
         genai.configure(api_key=api_key)
-
         model = genai.GenerativeModel(
-            model_name=getattr(settings, "gemini_api_model", "gemini-1.5-flash"),
+            model_name=getattr(settings, "gemini_api_model", "gemini-2.0-flash"),
             system_instruction=SYSTEM_PROMPT,
         )
 
-        # Construir historial de chat en formato google-generativeai
         chat_history = []
         if history:
             for msg in history[-10:]:
@@ -136,57 +184,35 @@ async def _api_key_stream(
         chat = model.start_chat(history=chat_history)
         prompt = _build_prompt(question, species, category, context)
 
-        # send_message con stream=True devuelve un iterador síncrono
-        # lo envolvemos en un thread para no bloquear el event loop
         loop = asyncio.get_event_loop()
         response_iter = await loop.run_in_executor(
-            None,
-            lambda: chat.send_message(prompt, stream=True),
+            None, lambda: chat.send_message(prompt, stream=True)
         )
 
         for chunk in response_iter:
             if chunk.text:
-                payload = json.dumps({"type": "token", "content": chunk.text})
-                yield f"data: {payload}\n\n"
-                await asyncio.sleep(0)  # cede el event loop entre chunks
+                yield f"data: {json.dumps({'type': 'token', 'content': chunk.text})}\n\n"
+                await asyncio.sleep(0)
 
-        done_payload = json.dumps({
-            "type": "done",
-            "context_sources": 1 if context else 0,
-        })
-        yield f"data: {done_payload}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'context_sources': 1 if context else 0, 'sources': []})}\n\n"
 
     except Exception as e:
-        error_payload = json.dumps({"type": "error", "message": str(e)})
-        yield f"data: {error_payload}\n\n"
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
 
 # ---------------------------------------------------------------------------
-# MODO 3: Vertex AI — producción GCP (de pago)
-# Requiere: google-cloud-aiplatform + Application Default Credentials
+# MODO 4: Vertex AI (producción GCP)
 # ---------------------------------------------------------------------------
 async def _vertex_stream(
-    question: str,
-    species: str | None,
-    category: str | None,
-    context: str,
-    history: list[dict] | None,
+    question: str, species: str | None, category: str | None,
+    context: str, history: list[dict] | None,
 ) -> AsyncGenerator[str, None]:
-    """Streaming real desde Vertex AI Gemini. Requiere credenciales GCP."""
     try:
         import vertexai
         from vertexai.generative_models import GenerativeModel, Content, Part
 
-        vertexai.init(
-            project=settings.gcp_project_id,
-            location=settings.vertex_ai_location,
-        )
-        model = GenerativeModel(
-            model_name=settings.vertex_ai_model,
-            system_instruction=SYSTEM_PROMPT,
-        )
-
-        prompt = _build_prompt(question, species, category, context)
+        vertexai.init(project=settings.gcp_project_id, location=settings.vertex_ai_location)
+        model = GenerativeModel(model_name=settings.vertex_ai_model, system_instruction=SYSTEM_PROMPT)
 
         chat_history = []
         if history:
@@ -195,20 +221,15 @@ async def _vertex_stream(
                 chat_history.append(Content(role=role, parts=[Part.from_text(msg["content"])]))
 
         chat = model.start_chat(history=chat_history)
+        prompt = _build_prompt(question, species, category, context)
         responses = chat.send_message(prompt, stream=True)
 
         for response in responses:
             if response.text:
-                payload = json.dumps({"type": "token", "content": response.text})
-                yield f"data: {payload}\n\n"
+                yield f"data: {json.dumps({'type': 'token', 'content': response.text})}\n\n"
                 await asyncio.sleep(0)
 
-        done_payload = json.dumps({
-            "type": "done",
-            "context_sources": 1 if context else 0,
-        })
-        yield f"data: {done_payload}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'context_sources': 1 if context else 0, 'sources': []})}\n\n"
 
     except Exception as e:
-        error_payload = json.dumps({"type": "error", "message": str(e)})
-        yield f"data: {error_payload}\n\n"
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
