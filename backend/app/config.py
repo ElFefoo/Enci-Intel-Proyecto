@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     disable_auth: bool = False
 
+    # ------------------------------------------------------------------
+    # CONSULTOR IA — mock local sin Vertex AI
+    # Activa con USE_GEMINI_MOCK=true en backend/.env
+    # En false, requiere credenciales GCP (Application Default Credentials)
+    # ------------------------------------------------------------------
+    use_gemini_mock: bool = True
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",")]
