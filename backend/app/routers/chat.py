@@ -1,180 +1,227 @@
 """
-Router: Consultor Veterinario IA
+Router del Módulo Consultor Veterinario IA.
 Endpoints:
-  POST /api/v1/chat/query       — chat SSE con Gemini
-  GET  /api/v1/chat/history     — lista sesiones del usuario
-  GET  /api/v1/chat/sessions/{session_id}/messages — mensajes de sesión
-  DELETE /api/v1/chat/history   — borra historial del usuario
+  POST /api/v1/chat/query     -> streaming SSE
+  GET  /api/v1/chat/history   -> historial del usuario
+  DELETE /api/v1/chat/history -> eliminar historial
 """
 import json
-from typing import Optional, Annotated
+import uuid
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field, field_validator
 
-from app.middleware.auth import CurrentUser, get_current_user
-from app.services.firestore_service import get_firestore
+from app.config import get_settings
 from app.services.gemini_service import stream_gemini_response
-from app.services.context_builder import build_market_context
-from app.services.chat_repository import (
-    get_or_create_session,
-    save_message,
-    get_session_history,
-    list_user_sessions,
-    delete_user_history,
-)
-from app.schemas.chat import ChatQueryRequest
+from app.services.firestore_service import get_firestore
+from app.dependencies.auth import get_current_user
 
-router = APIRouter()
+router = APIRouter(prefix="/chat", tags=["Consultor IA"])
+settings = get_settings()
+
+SPECIES_VALUES = {"aves", "porcinos", "rumiantes", "peces", "caninos", "felinos", "equinos"}
 
 
-@router.post("/chat/query", summary="Consultor Vet IA — Streaming SSE")
+class ChatQueryRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    species: str | None = Field(default=None)
+    category: str | None = Field(default=None)
+    session_id: str | None = Field(default=None)
+
+    @field_validator("species")
+    @classmethod
+    def validate_species(cls, v: str | None) -> str | None:
+        if v and v not in SPECIES_VALUES:
+            raise ValueError(f"species inválido. Valores permitidos: {', '.join(sorted(SPECIES_VALUES))}")
+        return v
+
+
+async def _get_rate_count(user_id: str, db) -> int:
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        doc = await db.collection("rate_limits").document(f"{user_id}_{today}").get()
+        return doc.to_dict().get("count", 0) if doc.exists else 0
+    except Exception:
+        return 0
+
+
+async def _increment_rate_limit(user_id: str, db) -> None:
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        ref = db.collection("rate_limits").document(f"{user_id}_{today}")
+        doc = await ref.get()
+        count = doc.to_dict().get("count", 0) if doc.exists else 0
+        await ref.set({"user_id": user_id, "date": today, "count": count + 1})
+    except Exception:
+        pass
+
+
+async def _get_recent_alerts(db) -> str:
+    """Inyecta las 5 alertas más recientes como contexto de mercado en el prompt del LLM."""
+    try:
+        alerts = []
+        query = db.collection("alerts").order_by("created_at", direction="DESCENDING").limit(5)
+        async for doc in query.stream():
+            d = doc.to_dict()
+            alerts.append(
+                f"- [{d.get('type', '')}] {d.get('title', '')} "
+                f"({d.get('competitor', '')}): {d.get('body', '')}"
+            )
+        return "\n".join(alerts) if alerts else ""
+    except Exception:
+        return ""
+
+
+async def _get_session_history(session_id: str, db) -> list[dict]:
+    """Recupera historial de sesión para pasarlo como context window al LLM."""
+    history = []
+    try:
+        query = (
+            db.collection("chat_messages")
+            .where("session_id", "==", session_id)
+            .order_by("created_at")
+            .limit(10)
+        )
+        async for doc in query.stream():
+            d = doc.to_dict()
+            history.append({"role": "user", "content": d["question"]})
+            history.append({"role": "assistant", "content": d["answer"]})
+    except Exception:
+        pass
+    return history
+
+
+async def _save_message(
+    user_id: str, session_id: str, message_id: str,
+    request: ChatQueryRequest, full_answer: str, db
+) -> None:
+    try:
+        await db.collection("chat_messages").document(message_id).set({
+            "id": message_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "question": request.question,
+            "answer": full_answer,
+            "species": request.species,
+            "category": request.category,
+            "sources": [],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+
+
+@router.post("/query")
 async def chat_query(
-    body: ChatQueryRequest,
-    user: Annotated[CurrentUser, Depends(get_current_user)],
+    request: ChatQueryRequest,
+    current_user: dict = Depends(get_current_user),
     db=Depends(get_firestore),
 ):
-    """
-    Recibe una pregunta veterinaria y responde con streaming SSE token a token.
-    - Crea o reutiliza sesión de conversación.
-    - Inyecta contexto de alertas recientes de Firestore.
-    - Persiste pregunta y respuesta completa en Firestore.
-    """
-    if len(body.question) > 2000:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"success": False, "error": {"code": "QUESTION_TOO_LONG", "message": "La pregunta supera los 2000 caracteres."}},
-        )
+    user_id = current_user.get("uid", "dev-user")
+    session_id = request.session_id or str(uuid.uuid4())
+    message_id = str(uuid.uuid4())
 
-    async def generate():
-        # 1. Obtener o crear sesión
-        try:
-            session_id = await get_or_create_session(
-                db, user.user_id, body.session_id, body.question
+    if not settings.disable_auth:
+        count = await _get_rate_count(user_id, db)
+        if count >= settings.chat_rate_limit_per_day:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "RATE_LIMIT_EXCEEDED",
+                    "message": f"Límite de {settings.chat_rate_limit_per_day} consultas/día alcanzado."
+                }
             )
-        except Exception:
-            session_id = body.session_id or "local-session"
 
-        # 2. Guardar mensaje del usuario
-        try:
-            await save_message(
-                db, session_id, user.user_id,
-                role="user",
-                content=body.question,
-                species=body.species,
-                category=body.category,
-            )
-        except Exception:
-            pass
+    history = await _get_session_history(session_id, db) if request.session_id else []
+    alert_context = await _get_recent_alerts(db)
 
-        # 3. Obtener historial de contexto
-        try:
-            history = await get_session_history(db, session_id, user.user_id)
-        except Exception:
-            history = []
+    full_answer: list[str] = []
 
-        # 4. Construir contexto de mercado desde alertas
-        try:
-            context = await build_market_context(db, body.species, body.category)
-        except Exception:
-            context = ""
-
-        # 5. Stream de Gemini token a token
-        full_response = []
+    async def event_stream():
         async for event in stream_gemini_response(
-            question=body.question,
-            species=body.species,
-            category=body.category,
-            context=context,
+            question=request.question,
+            species=request.species,
+            category=request.category,
+            context=alert_context,
             history=history,
         ):
-            # Capturar tokens para persistir al final
-            try:
-                parsed = json.loads(event.replace("data: ", "").strip())
-                if parsed.get("type") == "token":
-                    full_response.append(parsed.get("content", ""))
-                elif parsed.get("type") == "done":
-                    # Enriquecer el evento done con session_id real
-                    parsed["session_id"] = session_id
-                    event = f"data: {json.dumps(parsed)}\n\n"
-            except Exception:
-                pass
-            yield event
-
-        # 6. Persistir respuesta completa del asistente
-        if full_response:
-            try:
-                await save_message(
-                    db, session_id, user.user_id,
-                    role="assistant",
-                    content="".join(full_response),
-                    species=body.species,
-                    category=body.category,
-                )
-            except Exception:
-                pass
+            if event.startswith("data: "):
+                try:
+                    parsed = json.loads(event[6:])
+                    if parsed.get("type") == "token":
+                        full_answer.append(parsed.get("content", ""))
+                        yield event
+                    elif parsed.get("type") == "done":
+                        parsed["session_id"] = session_id
+                        parsed["message_id"] = message_id
+                        yield f"data: {json.dumps(parsed)}\n\n"
+                        import asyncio
+                        asyncio.create_task(_save_message(
+                            user_id, session_id, message_id,
+                            request, "".join(full_answer), db
+                        ))
+                        asyncio.create_task(_increment_rate_limit(user_id, db))
+                        return
+                    elif parsed.get("type") == "error":
+                        yield event
+                        return
+                except Exception:
+                    yield event
+            else:
+                yield event
 
     return StreamingResponse(
-        generate(),
+        event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-@router.get("/chat/history", summary="Lista sesiones del usuario")
+@router.get("/history")
 async def get_chat_history(
-    user: Annotated[CurrentUser, Depends(get_current_user)],
-    db=Depends(get_firestore),
-    limit: int = Query(default=20, ge=1, le=100),
-    cursor: Optional[str] = Query(default=None),
-):
-    """Retorna las sesiones de conversación del usuario paginadas."""
-    try:
-        sessions, has_more = await list_user_sessions(db, user.user_id, limit, cursor)
-        next_cursor = sessions[-1]["id"] if has_more and sessions else None
-        return {
-            "success": True,
-            "data": sessions,
-            "meta": {"limit": limit, "has_more": has_more, "next_cursor": next_cursor},
-        }
-    except Exception as e:
-        return {"success": True, "data": [], "meta": {"limit": limit, "has_more": False, "next_cursor": None}}
-
-
-@router.get("/chat/sessions/{session_id}/messages", summary="Mensajes de una sesión")
-async def get_session_messages(
-    session_id: str,
-    user: Annotated[CurrentUser, Depends(get_current_user)],
-    db=Depends(get_firestore),
-    limit: int = Query(default=50, ge=1, le=100),
-):
-    """Retorna los mensajes de una sesión específica del usuario."""
-    try:
-        messages = await get_session_history(db, session_id, user.user_id, limit)
-        return {
-            "success": True,
-            "data": messages,
-            "meta": {"session_id": session_id, "count": len(messages)},
-        }
-    except Exception:
-        return {"success": True, "data": [], "meta": {"session_id": session_id, "count": 0}}
-
-
-@router.delete("/chat/history", summary="Borra historial completo del usuario")
-async def clear_chat_history(
-    user: Annotated[CurrentUser, Depends(get_current_user)],
+    limit: int = 20,
+    cursor: str | None = None,
+    species: str | None = None,
+    session_id: str | None = None,
+    current_user: dict = Depends(get_current_user),
     db=Depends(get_firestore),
 ):
-    """Elimina permanentemente todas las sesiones y mensajes del usuario autenticado."""
+    user_id = current_user.get("uid", "dev-user")
     try:
-        deleted_count = await delete_user_history(db, user.user_id)
-        return {"success": True, "data": {"deleted_count": deleted_count}}
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"success": False, "error": {"code": "INTERNAL_ERROR", "message": str(e)}},
+        query = (
+            db.collection("chat_messages")
+            .where("user_id", "==", user_id)
+            .order_by("created_at")
+            .limit(min(limit, 100))
         )
+        if species:
+            query = query.where("species", "==", species)
+        if session_id:
+            query = query.where("session_id", "==", session_id)
+        messages = []
+        async for doc in query.stream():
+            messages.append(doc.to_dict())
+        return {"success": True, "data": messages, "meta": {"total": len(messages), "has_more": False}}
+    except Exception:
+        return {"success": True, "data": [], "meta": {"total": 0, "has_more": False}}
+
+
+@router.delete("/history")
+async def delete_chat_history(
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_firestore),
+):
+    user_id = current_user.get("uid", "dev-user")
+    deleted = 0
+    try:
+        async for doc in db.collection("chat_messages").where("user_id", "==", user_id).stream():
+            await doc.reference.delete()
+            deleted += 1
+    except Exception:
+        pass
+    return {
+        "success": True,
+        "data": {"deleted_count": deleted, "deleted_at": datetime.now(timezone.utc).isoformat()}
+    }
