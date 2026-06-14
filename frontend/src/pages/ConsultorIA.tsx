@@ -4,6 +4,8 @@ import remarkGfm from 'remark-gfm'
 import { useChat } from '../hooks/useChat'
 import type { ChatMessage, Species } from '../types/chat'
 
+const API_BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000/api/v1'
+
 const SPECIES_OPTIONS: { value: Species; label: string }[] = [
   { value: 'aves', label: '🐔 Aves' },
   { value: 'porcinos', label: '🐷 Porcinos' },
@@ -43,8 +45,7 @@ function FeedbackButtons({ msgId, onFeedback }: { msgId: string; onFeedback: (id
             voted === v
               ? v === 'up' ? 'bg-green-100 text-green-600' : 'bg-red-100 text-red-500'
               : 'text-gray-400 hover:bg-gray-100'
-          }`}
-        >
+          }`}>
           {v === 'up' ? '👍' : '👎'}
         </button>
       ))}
@@ -58,6 +59,15 @@ function SourcesBadge({ count }: { count: number }) {
     <span className="text-xs bg-blue-50 text-blue-500 border border-blue-100 rounded-full px-2 py-0.5">
       📚 {count} fuente{count !== 1 ? 's' : ''}
     </span>
+  )
+}
+
+function ErrorBanner({ message, onClose }: { message: string; onClose: () => void }) {
+  return (
+    <div className="mx-6 mt-3 bg-red-50 border border-red-200 rounded-xl px-4 py-3 flex items-start gap-3 shrink-0">
+      <span className="text-red-600 text-sm flex-1">{message}</span>
+      <button onClick={onClose} className="text-red-400 hover:text-red-600 font-bold text-xs">✕</button>
+    </div>
   )
 }
 
@@ -101,12 +111,13 @@ function MessageBubble({ msg, onFeedback }: { msg: ChatMessage; onFeedback: (id:
 }
 
 function SessionSidebar({
-  sessions, activeId, onSelect, onNew,
+  sessions, activeId, onSelect, onNew, onDeleteAll,
 }: {
-  sessions: { id: string; title: string; createdAt: Date }[]
+  sessions: { id: string; title: string; createdAt: Date; sessionId?: string }[]
   activeId?: string
-  onSelect: (id: string) => void
+  onSelect: (id: string, sessionId?: string) => void
   onNew: () => void
+  onDeleteAll: () => void
 }) {
   return (
     <aside className="w-52 shrink-0 border-r border-gray-200 bg-gray-50 flex flex-col">
@@ -121,7 +132,7 @@ function SessionSidebar({
           <p className="text-xs text-gray-400 text-center mt-6">Sin historial aún</p>
         )}
         {sessions.map(s => (
-          <button key={s.id} onClick={() => onSelect(s.id)}
+          <button key={s.id} onClick={() => onSelect(s.id, s.sessionId)}
             className={`w-full text-left px-3 py-2 rounded-lg text-xs transition-colors ${
               s.id === activeId ? 'bg-green-100 text-green-700 font-medium' : 'text-gray-600 hover:bg-gray-100'
             }`}>
@@ -132,16 +143,24 @@ function SessionSidebar({
           </button>
         ))}
       </div>
+      {sessions.length > 0 && (
+        <div className="p-3 border-t border-gray-100">
+          <button onClick={onDeleteAll}
+            className="w-full text-xs text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg py-1.5 transition-colors">
+            🗑 Borrar historial
+          </button>
+        </div>
+      )}
     </aside>
   )
 }
 
 export default function ConsultorIA() {
-  const { messages, isStreaming, sendMessage, stopStreaming, clearMessages } = useChat()
+  const { messages, isStreaming, error, sessionId, sendMessage, stopStreaming, clearMessages, loadSession } = useChat()
   const [input, setInput] = useState('')
   const [species, setSpecies] = useState<Species | undefined>()
   const [category, setCategory] = useState('')
-  const [sessions, setSessions] = useState<{ id: string; title: string; createdAt: Date }[]>([])
+  const [sessions, setSessions] = useState<{ id: string; title: string; createdAt: Date; sessionId?: string }[]>([])
   const [activeSessionId, setActiveSessionId] = useState<string | undefined>()
   const bottomRef = useRef<HTMLDivElement>(null)
 
@@ -153,22 +172,46 @@ export default function ConsultorIA() {
         id: crypto.randomUUID(),
         title: messages[0].content.slice(0, 45) + (messages[0].content.length > 45 ? '...' : ''),
         createdAt: new Date(),
+        sessionId,
       }
       setSessions(prev => [s, ...prev])
       setActiveSessionId(s.id)
     }
-  }, [messages])
+  }, [messages, sessionId])
+
+  useEffect(() => {
+    if (sessionId && activeSessionId) {
+      setSessions(prev => prev.map(s =>
+        s.id === activeSessionId ? { ...s, sessionId } : s
+      ))
+    }
+  }, [sessionId, activeSessionId])
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!input.trim() || isStreaming) return
-    if (input.trim().length > 2000) return
+    if (!input.trim() || isStreaming || input.length > 2000) return
     sendMessage(input.trim(), species, category || undefined)
     setInput('')
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(e as unknown as React.FormEvent) }
+  }
+
+  const handleSelectSession = async (localId: string, sid?: string) => {
+    setActiveSessionId(localId)
+    if (sid) await loadSession(sid)
+    else clearMessages()
+  }
+
+  const handleDeleteAll = async () => {
+    if (!confirm('¿Eliminar todo el historial? Esta acción es irreversible.')) return
+    try {
+      await fetch(`${API_BASE}/chat/history`, { method: 'DELETE' })
+    } catch { /* silencioso */ }
+    setSessions([])
+    clearMessages()
+    setActiveSessionId(undefined)
   }
 
   const handleFeedback = useCallback((msgId: string, vote: 'up' | 'down') => {
@@ -188,20 +231,24 @@ export default function ConsultorIA() {
   }
 
   const charCount = input.length
-  const charWarning = charCount > 1800
 
   return (
     <div className="flex h-full">
-      <SessionSidebar sessions={sessions} activeId={activeSessionId} onSelect={setActiveSessionId} onNew={() => { clearMessages(); setActiveSessionId(undefined) }} />
+      <SessionSidebar
+        sessions={sessions}
+        activeId={activeSessionId}
+        onSelect={handleSelectSession}
+        onNew={() => { clearMessages(); setActiveSessionId(undefined) }}
+        onDeleteAll={handleDeleteAll}
+      />
 
       <div className="flex flex-col flex-1 min-w-0">
-        {/* Header */}
         <div className="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-full bg-green-600 flex items-center justify-center text-white font-bold text-xs">IA</div>
             <div>
               <h1 className="font-semibold text-gray-900 text-sm">Consultor Veterinario IA</h1>
-              <p className="text-xs text-gray-400">Powered by Gemini · Encipharm</p>
+              <p className="text-xs text-gray-400">Powered by Groq · Encipharm</p>
             </div>
           </div>
           {messages.length > 0 && (
@@ -212,7 +259,6 @@ export default function ConsultorIA() {
           )}
         </div>
 
-        {/* Filtros */}
         <div className="bg-white border-b border-gray-100 px-6 py-2 flex items-center gap-3 shrink-0">
           <span className="text-xs text-gray-400 font-medium">Filtrar:</span>
           <select value={species ?? ''} onChange={e => setSpecies((e.target.value as Species) || undefined)}
@@ -225,9 +271,10 @@ export default function ConsultorIA() {
             className="text-xs border border-gray-200 rounded-lg px-3 py-1 text-gray-700 focus:outline-none focus:ring-2 focus:ring-green-500 w-48" />
         </div>
 
-        {/* Mensajes */}
+        {error && <ErrorBanner message={error} onClose={() => {}} />}
+
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
-          {messages.length === 0 && (
+          {messages.length === 0 && !error && (
             <div className="flex flex-col items-center justify-center h-full text-center">
               <div className="w-16 h-16 rounded-full bg-green-100 flex items-center justify-center text-3xl mb-4">🐄</div>
               <h2 className="text-lg font-semibold text-gray-700 mb-1">Consultor Veterinario IA</h2>
@@ -246,7 +293,6 @@ export default function ConsultorIA() {
           <div ref={bottomRef} />
         </div>
 
-        {/* Input */}
         <div className="bg-white border-t border-gray-200 px-6 py-4 shrink-0">
           <form onSubmit={handleSubmit} className="flex gap-3 items-end">
             <div className="flex-1 relative">
@@ -254,11 +300,11 @@ export default function ConsultorIA() {
                 placeholder="Escribe tu consulta veterinaria... (Enter para enviar, Shift+Enter nueva línea)"
                 rows={1} disabled={isStreaming} maxLength={2000}
                 className={`w-full resize-none border rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-50 disabled:text-gray-400 max-h-32 overflow-y-auto ${
-                  charWarning ? 'border-orange-300' : 'border-gray-200'
+                  charCount > 1800 ? 'border-orange-300' : 'border-gray-200'
                 }`}
                 style={{ minHeight: '44px' }} />
-              {charWarning && (
-                <span className="absolute bottom-1 right-3 text-xs text-orange-400">{charCount}/2000</span>
+              {charCount > 1800 && (
+                <span className="absolute bottom-2 right-3 text-xs text-orange-400">{charCount}/2000</span>
               )}
             </div>
             {isStreaming ? (
